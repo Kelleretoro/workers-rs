@@ -1,15 +1,17 @@
 use crate::binary::{GetBinary, WasmOpt};
 use crate::emoji;
+use crate::emscripten;
 use crate::lockfile::{DepCheckError, Lockfile};
+use crate::source_map;
 use crate::versions::{
-    CUR_WORKER_VERSION, LATEST_WASM_BINDGEN_VERSION, MIN_WASM_BINDGEN_LIB_VERSION,
-    MIN_WORKER_LIB_VERSION,
+    CUR_WORKER_VERSION, LATEST_WASM_BINDGEN_VERSION, MIN_EMSCRIPTEN_DEBUG_WASM_BINDGEN_VERSION,
+    MIN_WASM_BINDGEN_LIB_VERSION, MIN_WORKER_LIB_VERSION,
 };
 
 mod manifest;
 mod progressbar;
 mod target;
-mod utils;
+pub(crate) mod utils;
 
 use console::style;
 use progressbar::ProgressOutput;
@@ -48,6 +50,11 @@ pub struct Build {
     pub extra_options: Vec<String>,
     pub wasm_bindgen_version: Option<String>,
     pub panic_unwind: bool,
+    pub emscripten: bool,
+    pub bin: Option<String>,
+    pub emscripten_toolchain: Option<emscripten::Toolchain>,
+    /// The build writes a source map.
+    pub source_map: bool,
 }
 
 /// What sort of output we're going to be generating and flags we're invoking
@@ -168,6 +175,16 @@ pub struct BuildOptions {
     /// with panic=unwind, allowing panics to be caught and converted to
     /// JavaScript errors instead of aborting the Worker.
     pub panic_unwind: bool,
+
+    #[clap(long = "emscripten")]
+    /// Build for wasm32-unknown-emscripten. Links a bin target through emcc,
+    /// which runs wasm-bindgen post-link, on a worker-build provisioned
+    /// Emscripten toolchain.
+    pub emscripten: bool,
+
+    #[clap(long = "bin", requires = "emscripten")]
+    /// The bin target to link for --emscripten when the package has several.
+    pub bin: Option<String>,
 }
 
 type BuildStep = fn(&mut Build) -> Result<()>;
@@ -226,12 +243,19 @@ impl Build {
             extra_options: build_opts.extra_options,
             wasm_bindgen_version: None,
             panic_unwind: build_opts.panic_unwind,
+            emscripten: build_opts.emscripten,
+            bin: build_opts.bin,
+            emscripten_toolchain: None,
+            source_map: false,
         })
     }
 
     /// Prepare this `Build` command.
     pub fn init(&mut self) -> Result<()> {
-        let process_steps = Build::get_preprocess_steps();
+        if self.emscripten && self.panic_unwind {
+            bail!("--panic-unwind is not supported with --emscripten");
+        }
+        let process_steps = Build::get_preprocess_steps(self.emscripten);
         for (_, process_step) in process_steps {
             process_step(self)?;
         }
@@ -240,7 +264,7 @@ impl Build {
 
     /// Execute this `Build` command.
     pub fn run(&mut self) -> Result<()> {
-        let process_steps = Build::get_process_steps(self.no_opt);
+        let process_steps = Build::get_process_steps(self.no_opt, self.emscripten);
 
         let started = Instant::now();
 
@@ -266,7 +290,7 @@ impl Build {
     }
 
     #[allow(clippy::vec_init_then_push)]
-    fn get_preprocess_steps() -> Vec<(&'static str, BuildStep)> {
+    fn get_preprocess_steps(emscripten: bool) -> Vec<(&'static str, BuildStep)> {
         macro_rules! steps {
             ($($name:ident),+) => {
                 {
@@ -277,18 +301,22 @@ impl Build {
                 };
             ($($name:ident,)*) => (steps![$($name),*])
         }
-        steps![
+        let mut steps = steps![
             step_check_rustc_version,
             step_check_crate_config,
             step_check_for_wasm_target,
             step_check_nightly_prerequisites,
             step_check_lib_versions,
             step_install_wasm_bindgen,
-        ]
+        ];
+        if emscripten {
+            steps.extend(steps![step_provision_emscripten]);
+        }
+        steps
     }
 
     #[allow(clippy::vec_init_then_push)]
-    fn get_process_steps(no_opt: bool) -> Vec<(&'static str, BuildStep)> {
+    fn get_process_steps(no_opt: bool, emscripten: bool) -> Vec<(&'static str, BuildStep)> {
         macro_rules! steps {
             ($($name:ident),+) => {
                 {
@@ -300,14 +328,22 @@ impl Build {
             ($($name:ident,)*) => (steps![$($name),*])
         }
         let mut steps = Vec::new();
-        steps.extend(steps![
-            step_build_wasm,
-            step_create_dir,
-            step_run_wasm_bindgen,
-        ]);
-
-        if !no_opt {
-            steps.extend(steps![step_run_wasm_opt]);
+        // emcc runs wasm-bindgen and wasm-opt itself during the link.
+        if emscripten {
+            steps.extend(steps![
+                step_build_wasm,
+                step_create_dir,
+                step_collect_emscripten_output,
+            ]);
+        } else {
+            steps.extend(steps![
+                step_build_wasm,
+                step_create_dir,
+                step_run_wasm_bindgen,
+            ]);
+            if !no_opt {
+                steps.extend(steps![step_run_wasm_opt]);
+            }
         }
 
         steps.extend(steps![step_create_json,]);
@@ -324,14 +360,33 @@ impl Build {
 
     fn step_check_crate_config(&mut self) -> Result<()> {
         info!("Checking crate configuration...");
-        self.crate_data.check_crate_config()?;
+        if self.emscripten {
+            self.bin = Some(self.crate_data.resolve_bin_target(self.bin.as_deref())?);
+            self.source_map = self
+                .crate_data
+                .configured_profile(self.profile.clone())
+                .source_map();
+        } else {
+            self.crate_data.check_crate_config()?;
+            if self
+                .crate_data
+                .configured_profile(self.profile.clone())
+                .source_map()
+            {
+                PBAR.warn("`source-map` is only supported for --emscripten builds and is ignored.");
+            }
+        }
         info!("Crate is correctly configured.");
         Ok(())
     }
 
     fn step_check_for_wasm_target(&mut self) -> Result<()> {
         info!("Checking for wasm-target...");
-        target::check_for_wasm32_target()?;
+        target::check_for_wasm32_target(if self.emscripten {
+            target::WASM32_EMSCRIPTEN
+        } else {
+            target::WASM32_UNKNOWN
+        })?;
         info!("Checking for wasm-target was successful.");
         Ok(())
     }
@@ -346,23 +401,144 @@ impl Build {
         Ok(())
     }
 
+    fn step_provision_emscripten(&mut self) -> Result<()> {
+        PBAR.info(&format!(
+            "{}Checking the Emscripten toolchain...",
+            emoji::TARGET
+        ));
+        self.emscripten_toolchain = Some(emscripten::provision()?);
+        Ok(())
+    }
+
     fn step_build_wasm(&mut self) -> Result<()> {
         info!("Building wasm...");
+        let emscripten =
+            self.emscripten_toolchain
+                .as_ref()
+                .map(|toolchain| target::EmscriptenBuild {
+                    toolchain,
+                    bin: self.bin.as_deref().unwrap(),
+                    tokio: self.crate_data.worker_tokio_feature(),
+                    bindgen_dir: self.bindgen.as_ref().unwrap().parent().unwrap(),
+                    source_map: self.source_map,
+                });
         target::cargo_build_wasm(
             &self.crate_path,
             self.profile.clone(),
             &self.extra_options,
             self.panic_unwind,
+            emscripten,
         )?;
 
-        info!(
-            "wasm built at {:#?}.",
-            &self
-                .crate_path
-                .join("target")
-                .join("wasm32-unknown-unknown")
-                .join("release")
-        );
+        info!("wasm built at {:#?}.", self.target_out_dir());
+        Ok(())
+    }
+
+    /// Cargo's output directory for the selected target and profile.
+    fn target_out_dir(&self) -> PathBuf {
+        let target_directory = {
+            let mut iter = self.extra_options.iter();
+            iter.find(|&it| it == "--target-dir")
+                .and_then(|_| iter.next())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| self.crate_data.target_directory().to_path_buf())
+        };
+        target_directory
+            .join(if self.emscripten {
+                target::WASM32_EMSCRIPTEN
+            } else {
+                target::WASM32_UNKNOWN
+            })
+            .join(profile_dir(&self.profile))
+    }
+
+    /// Copy emcc's `<bin>.js` and the wasm it imports into the output
+    /// directory under the `index` names the rest of the pipeline expects.
+    fn step_collect_emscripten_output(&mut self) -> Result<()> {
+        let bin = self.bin.as_deref().unwrap();
+        let out = self.target_out_dir();
+        let js_path = out.join(format!("{bin}.js"));
+        let js = std::fs::read_to_string(&js_path)
+            .with_context(|| format!("Failed to read emcc output {}", js_path.display()))?;
+        // `import source wasmModule from "./x.wasm";`, possibly minified.
+        let wasm_name = js
+            .split("import source ")
+            .skip(1)
+            .find_map(|rest| {
+                let (_, spec) = rest.split_once("from")?;
+                let spec = spec.trim_start();
+                let quote = spec.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+                let spec = &spec[1..spec[1..].find(quote)? + 1];
+                spec.strip_prefix("./").filter(|s| s.ends_with(".wasm"))
+            })
+            .ok_or_else(|| {
+                anyhow!(
+                    "emcc output {} has no `import source` of its wasm module",
+                    js_path.display()
+                )
+            })?;
+        let prefix = self.crate_data.name_prefix();
+        let wasm_out = format!("{prefix}_bg.wasm");
+        std::fs::copy(out.join(wasm_name), self.out_dir.join(&wasm_out))
+            .with_context(|| format!("Failed to copy {wasm_name}"))?;
+        std::fs::write(
+            self.out_dir.join(format!("{prefix}.js")),
+            js.replace(&format!("./{wasm_name}"), &format!("./{wasm_out}")),
+        )?;
+        // wasm-bindgen inline JS snippets are written beside the link output,
+        // which cargo does not uplift alongside the js and wasm.
+        if js.contains("./snippets/") {
+            let snippets = snippets_dir(&out, &js).ok_or_else(|| {
+                anyhow!(
+                    "emcc output imports wasm-bindgen snippets but none were found under {}",
+                    out.display()
+                )
+            })?;
+            copy_dir(&snippets, &self.out_dir.join("snippets"))?;
+        }
+        if self.source_map {
+            self.collect_source_map(&out, wasm_name, &wasm_out)?;
+        }
+        Ok(())
+    }
+
+    /// Copy the source map emcc wrote beside the link output to
+    /// `<wasm_out>.map`, and point `wasm_out`'s `sourceMappingURL` at it.
+    fn collect_source_map(&self, out: &Path, wasm_name: &str, wasm_out: &str) -> Result<()> {
+        let wasm = std::fs::read(out.join(wasm_name))?;
+        let map_path = source_map::find_link_map(link_output_dirs(out), wasm_name, &wasm)
+            .ok_or_else(|| {
+                anyhow!(
+                    "emcc wrote no source map for {wasm_name} under {}",
+                    out.display()
+                )
+            })?;
+        let roots = source_map::SourceRoots {
+            crate_dir: self.crate_path.clone(),
+            workspace_root: self.crate_data.workspace_root().to_path_buf(),
+            cargo_home: source_map::cargo_home(),
+        };
+        let map = source_map::relocate_map(
+            &std::fs::read_to_string(&map_path)
+                .with_context(|| format!("Failed to read {}", map_path.display()))?,
+            map_path.parent().unwrap(),
+            &roots,
+            wasm_out,
+        )
+        .with_context(|| format!("Invalid source map {}", map_path.display()))?;
+        if !map.has_crate_sources {
+            PBAR.warn(&format!(
+                "The source map has no locations in {}. Set `debug = \"line-tables-only\"` in the \
+                 Cargo profile so stack traces map to your code.",
+                self.crate_path.display()
+            ));
+        }
+        let map_out = format!("{wasm_out}.map");
+        std::fs::write(self.out_dir.join(&map_out), map.json)?;
+        let wasm_out = self.out_dir.join(wasm_out);
+        let updated = source_map::set_source_mapping_url(&std::fs::read(&wasm_out)?, &map_out)?;
+        std::fs::write(&wasm_out, updated)
+            .with_context(|| format!("Failed to write {}", wasm_out.display()))?;
         Ok(())
     }
 
@@ -427,8 +603,23 @@ impl Build {
     fn step_install_wasm_bindgen(&mut self) -> Result<()> {
         info!("Installing wasm-bindgen-cli...");
         use crate::binary::{GetBinary, WasmBindgen};
-        let (bindgen, bindgen_override) =
-            WasmBindgen(self.wasm_bindgen_version.as_ref().unwrap()).get_binary(None)?;
+        let version = self.wasm_bindgen_version.as_ref().unwrap();
+        let (bindgen, bindgen_override) = WasmBindgen(version).get_binary(None)?;
+        // emcc runs wasm-bindgen with --keep-debug; before #5328 its DWARF
+        // output fails binaryen's exnref translation. Debug builds and source
+        // maps both carry DWARF through that step.
+        let min = &*MIN_EMSCRIPTEN_DEBUG_WASM_BINDGEN_VERSION;
+        if self.emscripten
+            && !bindgen_override
+            && (!matches!(self.profile, BuildProfile::Release) || self.source_map)
+            && semver::Version::parse(version)? < *min
+        {
+            bail!(
+                "--emscripten builds with debug info or `source-map` need wasm-bindgen {min} or \
+                 later (wasm-bindgen/wasm-bindgen#5328), but this crate uses {version}. Update its \
+                 wasm-bindgen dependency, or set WASM_BINDGEN_BIN to a newer wasm-bindgen CLI."
+            );
+        }
         self.bindgen = Some(bindgen);
         self.bindgen_override = bindgen_override;
         info!("Installing wasm-bindgen-cli was successful.");
@@ -453,23 +644,76 @@ impl Build {
     }
 
     fn step_run_wasm_opt(&mut self) -> Result<()> {
-        let mut args = match self
+        let args = match self
             .crate_data
             .configured_profile(self.profile.clone())
             .wasm_opt_args()
         {
-            Some(args) => args,
+            Some(args) => wasm_opt_args(args),
             None => return Ok(()),
         };
-        args.push("--all-features".into());
-        // Keep the Wasm names section
-        args.push("--debuginfo".into());
         info!("executing wasm-opt with {args:?}");
         wasm_opt_run(&self.out_dir, &args).map_err(|e| {
             anyhow!(
                 "{e}\nTo disable `wasm-opt`, add `wasm-opt = false` to your package metadata in your `Cargo.toml`."
             )
         })
+    }
+}
+
+/// The directories cargo may have linked a bin into, where emcc also writes
+/// files cargo does not uplift. Older cargo links into `deps/`; newer cargo
+/// links bins into `build/<crate>/<hash>/out/`.
+fn link_output_dirs(profile_dir: &Path) -> Vec<PathBuf> {
+    let mut candidates = vec![profile_dir.join("deps")];
+    if let Ok(crates) = std::fs::read_dir(profile_dir.join("build")) {
+        for krate in crates.flatten() {
+            if let Ok(hashes) = std::fs::read_dir(krate.path()) {
+                candidates.extend(hashes.flatten().map(|h| h.path().join("out")));
+            }
+        }
+    }
+    candidates
+}
+
+/// The `snippets` directory wasm-bindgen wrote beside cargo's link output.
+/// The js names the snippet directories it imports, so the candidate holding
+/// every one of them is the right one.
+fn snippets_dir(profile_dir: &Path, js: &str) -> Option<PathBuf> {
+    let wanted: Vec<&str> = js
+        .split("./snippets/")
+        .skip(1)
+        .filter_map(|rest| rest.split('/').next())
+        .collect();
+    if wanted.is_empty() {
+        return None;
+    }
+    link_output_dirs(profile_dir)
+        .into_iter()
+        .map(|dir| dir.join("snippets"))
+        .find(|dir| wanted.iter().all(|w| dir.join(w).is_dir()))
+}
+
+fn copy_dir(from: &Path, to: &Path) -> Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
+}
+
+/// Cargo's output directory name for a profile.
+fn profile_dir(profile: &BuildProfile) -> &str {
+    match profile {
+        BuildProfile::Release | BuildProfile::Profiling => "release",
+        BuildProfile::Dev => "debug",
+        BuildProfile::Custom(name) => name,
     }
 }
 
@@ -487,11 +731,7 @@ pub fn wasm_bindgen_build(
     extra_args: &[String],
     extra_options: &[String],
 ) -> Result<()> {
-    let profile_name = match profile.clone() {
-        BuildProfile::Release | BuildProfile::Profiling => "release",
-        BuildProfile::Dev => "debug",
-        BuildProfile::Custom(profile_name) => &profile_name.clone(),
-    };
+    let profile_name = profile_dir(&profile);
 
     let out_dir = out_dir.to_str().unwrap();
 
@@ -553,6 +793,26 @@ pub fn wasm_bindgen_build(
     Ok(())
 }
 
+/// Appends the wasm features worker-build always enables to the profile's `wasm-opt` args.
+fn wasm_opt_args(mut args: Vec<String>) -> Vec<String> {
+    // Explicit feature set rather than --all-features so that new binaryen
+    // encodings (e.g. compact imports) are never emitted before workerd
+    // supports them. Covers rustc wasm32-unknown-unknown defaults plus the
+    // exception handling used by wasm-bindgen catch wrappers.
+    for feature in [
+        "mutable-globals",
+        "sign-ext",
+        "nontrapping-float-to-int",
+        "bulk-memory",
+        "multivalue",
+        "reference-types",
+        "exception-handling",
+    ] {
+        args.push(format!("--enable-{feature}"));
+    }
+    args
+}
+
 /// Execute `wasm-opt` over wasm binaries found in `out_dir`, downloading if
 /// necessary into `cache`. Passes `args` to each invocation of `wasm-opt`.
 pub fn wasm_opt_run(out_dir: &Path, args: &[String]) -> Result<()> {
@@ -576,4 +836,36 @@ pub fn wasm_opt_run(out_dir: &Path, args: &[String]) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod test {
+    use super::{manifest::CargoWasmPackProfile, wasm_opt_args};
+
+    /// The args wasm-opt runs with for a profile's `wasm-opt` setting.
+    fn args(profile: &str) -> Option<Vec<String>> {
+        toml::from_str::<CargoWasmPackProfile>(profile)
+            .unwrap()
+            .wasm_opt_args()
+            .map(wasm_opt_args)
+    }
+
+    #[test]
+    fn test_wasm_opt_args_enabled_keeps_names() {
+        let args = args("wasm-opt = true").unwrap();
+        assert_eq!(&args[..2], ["-O", "--debuginfo"]);
+        assert!(args[2..].iter().all(|arg| arg.starts_with("--enable-")));
+    }
+
+    #[test]
+    fn test_wasm_opt_args_explicit_args_used_as_written() {
+        let args = args(r#"wasm-opt = ["-O"]"#).unwrap();
+        assert_eq!(args[0], "-O");
+        assert!(args[1..].iter().all(|arg| arg.starts_with("--enable-")));
+    }
+
+    #[test]
+    fn test_wasm_opt_args_disabled() {
+        assert_eq!(args("wasm-opt = false"), None);
+    }
 }

@@ -16,6 +16,20 @@ extern "C" {
         keys: Vec<JsValue>,
     ) -> Result<js_sys::Promise, JsValue>;
 
+    #[wasm_bindgen(method, catch, js_name=get)]
+    pub fn get_with_options(
+        this: &DurableObjectStorage,
+        key: &str,
+        options: js_sys::Object,
+    ) -> Result<js_sys::Promise, JsValue>;
+
+    #[wasm_bindgen(method, catch, js_name=get)]
+    pub fn get_multiple_with_options(
+        this: &DurableObjectStorage,
+        keys: Vec<JsValue>,
+        options: js_sys::Object,
+    ) -> Result<js_sys::Promise, JsValue>;
+
     #[wasm_bindgen(method, catch)]
     pub fn put(
         this: &DurableObjectStorage,
@@ -77,4 +91,7 @@ extern "C" {
 
     #[wasm_bindgen(method, getter)]
     pub fn sql(this: &DurableObjectStorage) -> crate::types::SqlStorage;
+
+    #[wasm_bindgen(method, catch)]
+    pub fn sync(this: &DurableObjectStorage) -> Result<js_sys::Promise, JsValue>;
 }

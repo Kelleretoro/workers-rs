@@ -28,14 +28,19 @@ impl Context {
     /// terminates but does not block the response. For example, this is ideal for caching
     /// responses or handling logging.
     /// ```no_run
+    /// # use worker::*;
+    /// # fn example(context: Context, cache: Cache, request: Request, response: Response) {
     /// context.wait_until(async move {
-    ///     let _ = cache.put(request, response).await;
+    ///     let _ = cache.put(&request, response).await;
     /// });
+    /// # }
     /// ```
     pub fn wait_until<F>(&self, future: F)
     where
         F: Future<Output = ()> + 'static,
     {
+        // Captured now, so the future runs under the span active at this call.
+        let future = crate::observability::in_current_span(future);
         self.inner
             .wait_until(&future_to_promise(AssertUnwindSafe(async {
                 future.await;
@@ -67,15 +72,20 @@ impl Context {
     ///
     /// Then deserialize them to your custom type:
     /// ```no_run
+    /// # use worker::*;
     /// use serde::Deserialize;
     ///
     /// #[derive(Deserialize)]
+    /// #[allow(non_snake_case)]
     /// struct MyProps {
     ///     clientId: String,
     ///     permissions: Vec<String>,
     /// }
     ///
+    /// # fn example(ctx: Context) -> Result<()> {
     /// let props = ctx.props::<MyProps>()?;
+    /// # Ok(())
+    /// # }
     /// ```
     ///
     /// See: <https://developers.cloudflare.com/workers/runtime-apis/context/#props>

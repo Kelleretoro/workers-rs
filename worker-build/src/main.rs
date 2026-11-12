@@ -1,5 +1,5 @@
 use std::{
-    env::{self, VarError},
+    env,
     fs::{self, File},
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -11,35 +11,23 @@ use clap::Parser;
 
 const SHIM_FILE: &str = include_str!("./js/shim.js");
 const SHIM_UNWIND_FILE: &str = include_str!("./js/shim-unwind.js");
+const SHIM_PLAIN_FILE: &str = include_str!("./js/shim-plain.js");
 
 pub(crate) mod binary;
 mod build;
 mod build_lock;
 mod emoji;
+mod emscripten;
 mod lockfile;
-mod main_legacy;
 mod producers;
+mod source_map;
 mod versions;
+mod wasm_util;
 
 use build::{Build, BuildOptions};
 use build_lock::BuildLock;
 
-use crate::{
-    binary::{Esbuild, GetBinary},
-    build::Target,
-};
-
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-fn fix_wasm_import(out_dir: &Path) -> Result<()> {
-    let index_path = output_path(out_dir, "index.js");
-    let content = fs::read_to_string(&index_path)
-        .with_context(|| format!("Failed to read {}", index_path.display()))?;
-    let updated_content = content.replace("import source ", "import ");
-    fs::write(&index_path, updated_content)
-        .with_context(|| format!("Failed to write {}", index_path.display()))?;
-    Ok(())
-}
 
 fn update_package_json(out_dir: &Path) -> Result<()> {
     let package_json_path = output_path(out_dir, "package.json");
@@ -48,9 +36,16 @@ fn update_package_json(out_dir: &Path) -> Result<()> {
         .with_context(|| format!("Failed to read {}", package_json_path.display()))?;
     let mut package_json: serde_json::Value = serde_json::from_str(&original_content)?;
 
-    package_json["files"] = serde_json::json!(["index_bg.wasm", "index.js", "index.d.ts"]);
+    package_json["files"] = serde_json::json!([
+        "index_bg.wasm",
+        "index.js",
+        "index_bg.js",
+        "snippets",
+        "index.d.ts"
+    ]);
     package_json["main"] = serde_json::Value::String("index.js".to_string());
-    package_json["sideEffects"] = serde_json::json!(["./index.js"]);
+    package_json["sideEffects"] =
+        serde_json::json!(["./index.js", "./index_bg.js", "./snippets/*"]);
 
     let updated_content = serde_json::to_string_pretty(&package_json)?;
     fs::write(&package_json_path, updated_content)
@@ -85,17 +80,14 @@ pub fn main() -> Result<()> {
 
     builder.init()?;
 
-    let module_target = !no_panic_recovery && env::var("CUSTOM_SHIM").is_err();
-    if module_target {
+    let emscripten = builder.emscripten;
+    if !emscripten && !no_panic_recovery {
         builder.extra_args.extend_from_slice(&[
             "--experimental-reset-state-function".into(),
             "--force-enable-abort-handler".into(),
         ]);
-        builder.run()?;
-    } else {
-        builder.target = Target::Bundler;
-        builder.run()?;
     }
+    builder.run()?;
 
     let with_coredump = env::var("COREDUMP").is_ok();
     if with_coredump {
@@ -105,34 +97,37 @@ pub fn main() -> Result<()> {
 
     producers::inject_workers_rs_sdk_metadata(&staging_dir, VERSION)?;
 
-    if module_target {
-        let shim = if builder.panic_unwind {
-            SHIM_UNWIND_FILE
-        } else {
-            SHIM_FILE
-        }
-        .replace("$HANDLERS", &generate_handlers(&staging_dir)?);
-        let shim_path = output_path(&staging_dir, "shim.js");
-        fs::write(&shim_path, shim)
-            .with_context(|| format!("Failed to write {}", shim_path.display()))?;
-
-        add_export_wrappers(&staging_dir)?;
-
-        update_package_json(&staging_dir)?;
-
-        let esbuild_path = Esbuild.get_binary(None)?.0;
-        bundle(&staging_dir, &esbuild_path)?;
-
-        fix_wasm_import(&staging_dir)?;
-
-        remove_unused_files(&staging_dir)?;
-
-        create_wrapper_alias(&staging_dir, false)?;
+    let wrappers = if emscripten {
+        ExportWrappers::DurableObject
+    } else if no_panic_recovery {
+        ExportWrappers::Plain
     } else {
-        main_legacy::process(&staging_dir)?;
-        create_wrapper_alias(&staging_dir, true)?;
+        ExportWrappers::Recovery
+    };
+    let shim = match wrappers {
+        ExportWrappers::Recovery if builder.panic_unwind => SHIM_UNWIND_FILE,
+        ExportWrappers::Recovery => SHIM_FILE,
+        _ => SHIM_PLAIN_FILE,
     }
+    .replace("$HANDLERS", &generate_handlers(&staging_dir)?);
+    let shim_path = output_path(&staging_dir, "shim.js");
+    fs::write(&shim_path, shim)
+        .with_context(|| format!("Failed to write {}", shim_path.display()))?;
 
+    add_export_wrappers(&staging_dir, wrappers)?;
+
+    update_package_json(&staging_dir)?;
+
+    // The shim becomes the entry point, importing the generated module.
+    fs::rename(
+        output_path(&staging_dir, "index.js"),
+        output_path(&staging_dir, "index_bg.js"),
+    )?;
+    fs::rename(shim_path, output_path(&staging_dir, "index.js"))?;
+
+    create_wrapper_alias(&staging_dir)?;
+
+    remove_stale_sidecars(&out_dir, &staging_dir)?;
     // Swap staging entries into the real output directory and clean up.
     lock.finish()?;
 
@@ -144,13 +139,21 @@ fn generate_handlers(out_dir: &Path) -> Result<String> {
     let content = fs::read_to_string(&index_path)
         .with_context(|| format!("Failed to read {}", index_path.display()))?;
 
+    Ok(generate_handlers_from_content(&content))
+}
+
+fn generate_handlers_from_content(content: &str) -> String {
     // Extract ESM function exports from the wasm-bindgen generated output.
     // This code is specialized to what wasm-bindgen outputs for ESM and is therefore
     // brittle to upstream changes. It is comprehensive to current output patterns though.
     // TODO: Convert this to Wasm binary exports analysis for entry point detection instead.
+    // Emscripten output indents (or minifies) the wasm-bindgen exports.
     let mut func_names = Vec::new();
-    for line in content.lines() {
-        if let Some(rest) = line.strip_prefix("export function") {
+    for line in export_decls(content) {
+        if let Some(rest) = line
+            .strip_prefix("export function")
+            .or_else(|| line.strip_prefix("export async function"))
+        {
             if let Some(bracket_pos) = rest.find("(") {
                 let func_name = rest[..bracket_pos].trim();
                 // strip the exported function (we re-wrap all handlers)
@@ -171,8 +174,13 @@ fn generate_handlers(out_dir: &Path) -> Result<String> {
         }
     }
 
+    let has_tcp_connect = func_names.contains(&"connect");
+    let has_udp_connect = func_names.contains(&"connect_udp");
     let mut handlers = String::new();
     for func_name in func_names {
+        if func_name == "connect" || func_name == "connect_udp" {
+            continue;
+        }
         if func_name == "fetch" && env::var("RUN_TO_COMPLETION").is_ok() {
             handlers += "Entrypoint.prototype.fetch = async function fetch(request) {
   let response = exports.fetch(request, this.env, this.ctx);
@@ -198,22 +206,120 @@ fn generate_handlers(out_dir: &Path) -> Result<String> {
         }
     }
 
-    Ok(handlers)
+    // TCP and UDP connections share a single `connect` entrypoint, dispatched by socket protocol.
+    match (has_tcp_connect, has_udp_connect) {
+        (true, true) => {
+            handlers += "Entrypoint.prototype.connect = function connect (arg) {
+  if (arg.protocol === \"udp\") {
+    return exports.connect_udp.call(this, arg, this.env, this.ctx);
+  } else {
+    return exports.connect.call(this, arg, this.env, this.ctx);
+  }
+}
+";
+        }
+        (true, false) => {
+            handlers += "Entrypoint.prototype.connect = function connect (arg) {
+  if (arg.protocol === \"udp\") {
+    throw new TypeError(\"No UDP connect handler is defined\");
+  } else {
+    return exports.connect.call(this, arg, this.env, this.ctx);
+  }
+}
+";
+        }
+        (false, true) => {
+            handlers += "Entrypoint.prototype.connect = function connect (arg) {
+  if (arg.protocol === \"udp\") {
+    return exports.connect_udp.call(this, arg, this.env, this.ctx);
+  } else {
+    throw new TypeError(\"No TCP connect handler is defined\");
+  }
+}
+";
+        }
+        (false, false) => {}
+    }
+
+    handlers
+}
+
+#[cfg(test)]
+mod handler_tests {
+    use super::generate_handlers_from_content;
+
+    #[test]
+    fn generates_tcp_and_udp_connect_dispatch() {
+        let handlers = generate_handlers_from_content(
+            "export function connect() {}\nexport function connect_udp() {}\n",
+        );
+        assert!(handlers.contains("arg.protocol === \"udp\""));
+        assert!(handlers.contains("exports.connect_udp.call"));
+        assert!(handlers.contains("exports.connect.call"));
+        assert!(!handlers.contains("Entrypoint.prototype.connect_udp"));
+    }
+
+    #[test]
+    fn generates_udp_only_connect_handler() {
+        let handlers = generate_handlers_from_content("export function connect_udp() {}\n");
+        assert!(handlers.contains("Entrypoint.prototype.connect ="));
+        assert!(handlers.contains("arg.protocol === \"udp\""));
+        assert!(handlers.contains("No TCP connect handler is defined"));
+        assert!(handlers.contains("exports.connect_udp.call"));
+    }
+
+    #[test]
+    fn generates_tcp_only_connect_handler() {
+        let handlers = generate_handlers_from_content("export function connect() {}\n");
+        assert!(handlers.contains("arg.protocol === \"udp\""));
+        assert!(handlers.contains("No UDP connect handler is defined"));
+        assert!(handlers.contains("exports.connect.call"));
+    }
 }
 
 static SYSTEM_FNS: &[&str] = &["__wbg_reset_state", "__worker_init_state"];
 
-fn add_export_wrappers(out_dir: &Path) -> Result<()> {
+/// Each `export` declaration in the module text, starting at the keyword,
+/// whether the module is one declaration per line or minified.
+fn export_decls(content: &str) -> impl Iterator<Item = &str> {
+    content.match_indices("export ").filter_map(move |(i, _)| {
+        let boundary = i == 0
+            || content[..i]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_whitespace() || c == ';' || c == '}');
+        boundary.then(|| &content[i..])
+    })
+}
+
+/// How the shim re-exports the classes of the generated module.
+#[derive(Clone, Copy)]
+enum ExportWrappers {
+    /// Proxied, to reconstruct instances after a critical error reset.
+    Recovery,
+    Plain,
+    /// The runtime only exposes RPC on classes deriving from DurableObject.
+    DurableObject,
+}
+
+fn add_export_wrappers(out_dir: &Path, wrappers: ExportWrappers) -> Result<()> {
     let index_path = output_path(out_dir, "index.js");
     let content = fs::read_to_string(&index_path)
         .with_context(|| format!("Failed to read {}", index_path.display()))?;
 
     let mut class_names = Vec::new();
-    for line in content.lines() {
+    for line in export_decls(&content) {
+        // Emscripten output declares classes as `export var Name = class Name {`.
         if let Some(rest) = line.strip_prefix("export class ") {
             if let Some(brace_pos) = rest.find("{") {
                 let class_name = rest[..brace_pos].trim();
                 class_names.push(class_name.to_string());
+            }
+        } else if let Some(rest) = line.strip_prefix("export var ") {
+            if let Some((class_name, def)) = rest.split_once("=") {
+                if def.trim_start().starts_with("class") {
+                    class_names.push(class_name.trim().to_string());
+                }
             }
         }
     }
@@ -221,10 +327,23 @@ fn add_export_wrappers(out_dir: &Path) -> Result<()> {
     let shim_path = output_path(out_dir, "shim.js");
     let mut output = fs::read_to_string(&shim_path)
         .with_context(|| format!("Failed to read {}", shim_path.display()))?;
+    if matches!(wrappers, ExportWrappers::DurableObject) {
+        output.push_str("import { DurableObject } from \"cloudflare:workers\";\n");
+    }
     for class_name in class_names {
-        output.push_str(&format!(
-            "export const {class_name} = new Proxy(exports.{class_name}, classProxyHooks);\n"
-        ));
+        output.push_str(&match wrappers {
+            ExportWrappers::Recovery => format!(
+                "export const {class_name} = new Proxy(exports.{class_name}, classProxyHooks);\n"
+            ),
+            ExportWrappers::Plain => {
+                format!("export const {class_name} = exports.{class_name};\n")
+            }
+            ExportWrappers::DurableObject => format!(
+                "Object.setPrototypeOf(exports.{class_name}.prototype, DurableObject.prototype);\n\
+                 Object.setPrototypeOf(exports.{class_name}, DurableObject);\n\
+                 export const {class_name} = exports.{class_name};\n"
+            ),
+        });
     }
     fs::write(&shim_path, output)
         .with_context(|| format!("Failed to write {}", shim_path.display()))?;
@@ -296,37 +415,18 @@ fn wasm_coredump(out_dir: &Path) -> Result<()> {
     }
 }
 
-fn create_wrapper_alias(out_dir: &Path, legacy: bool) -> Result<()> {
-    let msg = if !legacy {
-        "// Use index.js directly, this file provided for backwards compat
+fn create_wrapper_alias(out_dir: &Path) -> Result<()> {
+    let shim_content = "// Use index.js directly, this file provided for backwards compat
 // with former shim.mjs only.
-"
-    } else {
-        ""
-    };
-    let path = if !legacy {
-        "../index.js"
-    } else {
-        "./worker/shim.mjs"
-    };
-    let shim_content = format!(
-        "{msg}export * from '{path}';
-export {{ default }} from '{path}';
-"
-    );
-
-    if !legacy {
-        let worker_dir = output_path(out_dir, "worker");
-        fs::create_dir_all(&worker_dir)
-            .with_context(|| format!("Failed to create directory {}", worker_dir.display()))?;
-        let shim_path = output_path(out_dir, "worker/shim.mjs");
-        fs::write(&shim_path, shim_content)
-            .with_context(|| format!("Failed to write {}", shim_path.display()))?;
-    } else {
-        let index_path = output_path(out_dir, "index.js");
-        fs::write(&index_path, shim_content)
-            .with_context(|| format!("Failed to write {}", index_path.display()))?;
-    }
+export * from '../index.js';
+export { default } from '../index.js';
+";
+    let worker_dir = output_path(out_dir, "worker");
+    fs::create_dir_all(&worker_dir)
+        .with_context(|| format!("Failed to create directory {}", worker_dir.display()))?;
+    let shim_path = output_path(out_dir, "worker/shim.mjs");
+    fs::write(&shim_path, shim_content)
+        .with_context(|| format!("Failed to write {}", shim_path.display()))?;
     Ok(())
 }
 
@@ -358,48 +458,15 @@ where
     Ok(command.build_options)
 }
 
-// Bundles the snippets and worker-related code into a single file.
-fn bundle(out_dir: &Path, esbuild_path: &Path) -> Result<()> {
-    let no_minify = !matches!(env::var("NO_MINIFY"), Err(VarError::NotPresent));
-    let path = out_dir
-        .canonicalize()
-        .with_context(|| format!("Failed to resolve output directory {}", out_dir.display()))?;
-    let esbuild_path = esbuild_path
-        .canonicalize()
-        .with_context(|| format!("Failed to resolve esbuild path {}", esbuild_path.display()))?;
-    let mut command = Command::new(esbuild_path);
-    command.args([
-        "--external:./index_bg.wasm",
-        "--external:cloudflare:email",
-        "--external:cloudflare:sockets",
-        "--external:cloudflare:workers",
-        "--format=esm",
-        "--bundle",
-        "./shim.js",
-        "--outfile=index.js",
-        "--allow-overwrite",
-    ]);
-
-    if !no_minify {
-        command.arg("--minify");
-    }
-
-    let exit_status = command.current_dir(path).spawn()?.wait()?;
-
-    match exit_status.success() {
-        true => Ok(()),
-        false => anyhow::bail!("esbuild exited with status {exit_status}"),
-    }
-}
-
-fn remove_unused_files(out_dir: &Path) -> Result<()> {
-    let shim_path = output_path(out_dir, "shim.js");
-    std::fs::remove_file(&shim_path)
-        .with_context(|| format!("Failed to remove {}", shim_path.display()))?;
-    let snippets_path = output_path(out_dir, "snippets");
-    if snippets_path.exists() {
-        std::fs::remove_dir_all(&snippets_path)
-            .with_context(|| format!("Failed to remove {}", snippets_path.display()))?;
+/// Remove the files an earlier build wrote beside its module, such as its
+/// source map, that this build did not write: they describe another module.
+fn remove_stale_sidecars(out_dir: &Path, staging_dir: &Path) -> Result<()> {
+    for entry in fs::read_dir(out_dir)? {
+        let name = entry?.file_name();
+        if name.to_string_lossy().starts_with("index_bg.wasm.") && !staging_dir.join(&name).exists()
+        {
+            fs::remove_file(out_dir.join(&name))?;
+        }
     }
     Ok(())
 }
@@ -410,7 +477,25 @@ pub fn output_path(out_dir: &Path, name: impl AsRef<str>) -> PathBuf {
 
 #[cfg(test)]
 mod test {
-    use super::parse_wasm_pack_opts;
+    use super::{parse_wasm_pack_opts, remove_stale_sidecars};
+    use std::fs;
+
+    #[test]
+    fn test_remove_stale_sidecars() {
+        let dir = std::env::temp_dir().join(format!("wb-sidecars-{}", std::process::id()));
+        let staging = dir.join(".tmp");
+        fs::create_dir_all(&staging).unwrap();
+        for name in ["index_bg.wasm", "index_bg.wasm.map", "index_bg.wasm.names"] {
+            fs::write(dir.join(name), "").unwrap();
+        }
+        fs::write(staging.join("index_bg.wasm.map"), "").unwrap();
+        remove_stale_sidecars(&dir, &staging).unwrap();
+        assert!(dir.join("index_bg.wasm").exists());
+        assert!(dir.join("index_bg.wasm.map").exists());
+        assert!(!dir.join("index_bg.wasm.names").exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn test_wasm_pack_args_build_arg() {
         let args = vec!["--release".to_owned()];

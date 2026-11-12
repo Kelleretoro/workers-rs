@@ -1,7 +1,9 @@
 use std::fmt::Display;
 use std::fmt::Formatter;
+use std::future::{Future, IntoFuture};
 use std::iter::{once, Once};
 use std::ops::Deref;
+use std::pin::Pin;
 use std::result::Result as StdResult;
 
 use js_sys::futures::JsFuture;
@@ -15,6 +17,7 @@ use worker_sys::types::D1Database as D1DatabaseSys;
 use worker_sys::types::D1DatabaseSession as D1DatabaseSessionSys;
 use worker_sys::types::D1ExecResult;
 use worker_sys::types::D1PreparedStatement as D1PreparedStatementSys;
+use worker_sys::types::D1PreparedStatementRawOptions as D1PreparedStatementRawOptionsSys;
 use worker_sys::types::D1Result as D1ResultSys;
 
 use crate::env::EnvBinding;
@@ -332,6 +335,7 @@ impl D1Argument for D1PreparedArgument<'_> {
 
 // A D1 prepared query statement.
 #[derive(Debug, Clone)]
+#[must_use = "D1PreparedStatement does nothing until you run or await it"]
 pub struct D1PreparedStatement(D1PreparedStatementSys);
 
 impl D1PreparedStatement {
@@ -430,6 +434,44 @@ impl D1PreparedStatement {
         Ok(vec)
     }
 
+    /// Executes a query against the database and returns the column names alongside a `Vec` of
+    /// rows, as `(column_names, rows)`.
+    ///
+    /// This calls `raw({ columnNames: true })`, which returns the column names as the first array
+    /// of the result. They are split out here so the rows stay uniformly typed as `T`.
+    ///
+    /// Useful when a caller indexes rows positionally but still needs to know which column each
+    /// position refers to, such as an ORM mapping layer.
+    ///
+    /// The column names are returned even when the query matches no rows, so this can be used to
+    /// inspect a statement's shape without a result set.
+    pub async fn raw_with_column_names<T>(&self) -> Result<(Vec<String>, Vec<Vec<T>>)>
+    where
+        T: for<'a> Deserialize<'a>,
+    {
+        let options = D1PreparedStatementRawOptionsSys::new();
+        options.set_column_names(true);
+
+        let result = JsFuture::from(self.0.raw_with_options(&options)?).await;
+        let result = cast_to_d1_error(result)?;
+        let result = result.dyn_into::<Array>()?;
+
+        let mut iter = result.iter();
+        // The header is always the first element, even for a zero-row result, so this branch is
+        // only a guard against an unexpectedly empty array rather than a normal case.
+        let Some(header) = iter.next() else {
+            return Ok((Vec::new(), Vec::new()));
+        };
+        let column_names: Vec<String> = serde_wasm_bindgen::from_value(header)?;
+
+        let mut rows = Vec::with_capacity(result.length().saturating_sub(1) as usize);
+        for value in iter {
+            rows.push(serde_wasm_bindgen::from_value(value)?);
+        }
+
+        Ok((column_names, rows))
+    }
+
     /// Executes a query against the database and returns a `Vec` of JsValues.
     pub async fn raw_js_value(&self) -> Result<Vec<JsValue>> {
         let result = JsFuture::from(self.0.raw()?).await;
@@ -442,6 +484,17 @@ impl D1PreparedStatement {
     /// Returns the inner JsValue bindings object.
     pub fn inner(&self) -> &D1PreparedStatementSys {
         &self.0
+    }
+}
+
+impl IntoFuture for D1PreparedStatement {
+    type Output = Result<D1Result>;
+    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output>>>;
+
+    /// Awaiting runs the statement via [`run`](D1PreparedStatement::run) and returns only metadata.
+    /// Use [`all`](D1PreparedStatement::all) or [`first`](D1PreparedStatement::first) to retrieve rows.
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move { self.run().await })
     }
 }
 
@@ -488,7 +541,7 @@ impl D1Result {
         if let Some(results) = self.0.results()? {
             let mut vec = Vec::with_capacity(results.length() as usize);
             for result in results.iter() {
-                let result = serde_wasm_bindgen::from_value(result).unwrap();
+                let result = serde_wasm_bindgen::from_value(result)?;
                 vec.push(result);
             }
             Ok(vec)
@@ -586,5 +639,20 @@ mod tests {
             D1SessionConstraint::FirstUnconstrained.as_str(),
             "first-unconstrained"
         );
+    }
+}
+
+#[cfg(test)]
+mod into_future_check {
+    // Awaiting a statement resolves through `run`, so the impl must yield
+    // `Result<D1Result>`. This compile-time check guards that contract.
+    use super::{D1PreparedStatement, D1Result};
+    use crate::Result;
+    use std::future::IntoFuture;
+
+    fn _assert_into_future<T: IntoFuture<Output = Result<D1Result>>>() {}
+    #[allow(dead_code)]
+    fn _check() {
+        _assert_into_future::<D1PreparedStatement>();
     }
 }

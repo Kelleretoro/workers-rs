@@ -56,6 +56,24 @@ pub async fn prepared_statement(
     assert_eq!(columns[1].as_str(), Some("Ryan Upton"));
     assert_eq!(columns[2].as_u64(), Some(21));
 
+    // The same rows, plus the column names they are positioned by.
+    let (column_names, rows) = stmt.raw_with_column_names::<serde_json::Value>().await?;
+    assert_eq!(column_names, vec!["id", "name", "age"]);
+    assert_eq!(rows.len(), 1);
+    let columns = &rows[0];
+
+    assert_eq!(columns[0].as_u64(), Some(6));
+    assert_eq!(columns[1].as_str(), Some("Ryan Upton"));
+    assert_eq!(columns[2].as_u64(), Some(21));
+
+    // Column names are still reported when the statement matches no rows.
+    let (column_names, rows) = worker::query!(&db, "SELECT * FROM people WHERE name = ?")
+        .bind_refs(&D1Type::Text("Nobody At All"))?
+        .raw_with_column_names::<serde_json::Value>()
+        .await?;
+    assert_eq!(column_names, vec!["id", "name", "age"]);
+    assert!(rows.is_empty());
+
     let stmt_2 = unbound_stmt.bind_refs([&D1Type::Text("John Smith")])?;
     let person = stmt_2.first::<Person>(None).await?.unwrap();
     assert_eq!(person.name, "John Smith");
@@ -297,7 +315,8 @@ pub async fn insert_and_retrieve_optional_none(
         &None::<String>,
         &None::<u32>
     )?;
-    query.run().await?;
+    // Run the insert by awaiting the statement directly (exercises IntoFuture).
+    query.await?;
 
     let stmt = worker::query!(&db, "SELECT * FROM nullable_people WHERE id = 3");
     let person = stmt.first::<NullablePerson>(None).await?.unwrap();
@@ -377,6 +396,30 @@ pub async fn retrive_first_none(
 
     let stmt = worker::query!(&db, "SELECT * FROM nullable_people WHERE id = 9999");
     assert!(stmt.first::<NullablePerson>(None).await?.is_none());
+
+    Response::ok("ok")
+}
+
+#[worker::send]
+pub async fn deserialize_with_type_mismatch(
+    _req: Request,
+    env: Env,
+    _data: SomeSharedData,
+) -> Result<Response> {
+    let db = env.d1("DB")?;
+
+    let error = worker::query!(&db, "SELECT 'hello' AS id")
+        .await?
+        .results::<NullablePerson>();
+
+    if let Err(error) = error {
+        assert_eq!(
+            error.to_string(),
+            "Error: invalid type: string \"hello\", expected u32"
+        );
+    } else {
+        panic!("Expected .results() to propagate its error");
+    }
 
     Response::ok("ok")
 }

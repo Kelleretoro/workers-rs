@@ -1,6 +1,6 @@
 use crate::build::PBAR;
 use crate::emoji::{CONFIG, DOWN_ARROW};
-use crate::versions::{CUR_ESBUILD_VERSION, CUR_WASM_OPT_VERSION};
+use crate::versions::CUR_WASM_OPT_VERSION;
 use anyhow::{bail, Context, Result};
 use flate2::read::GzDecoder;
 use heck::ToShoutySnakeCase;
@@ -47,7 +47,7 @@ pub trait GetBinary: BinaryDep {
         let url = self.download_url();
         let _ = remove_all_versions(name, target);
         PBAR.info(&format!("{DOWN_ARROW}Downloading {full_name}@{version}..."));
-        download(&url, &cache_path)?;
+        download_with_retries(&url, &cache_path, full_name)?;
         if !bin_path.exists() {
             bail!(
                 "Unable to locate binary {} in {full_name}",
@@ -118,13 +118,22 @@ fn remove_all_versions(name: &str, target: &str) -> Result<usize> {
     Ok(deleted_count)
 }
 
+/// Root of the worker-build cache directory
+pub(crate) fn cache_root() -> Result<PathBuf> {
+    let path = dirs_next::cache_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("worker-build");
+    if !path.exists() {
+        create_dir_all(&path)
+            .with_context(|| format!("Failed to create cache directory {}", path.display()))?;
+    }
+    Ok(path)
+}
+
 /// Cache path for this binary instance
 fn cache_path(name: &str, version: &str, target: &str) -> Result<PathBuf> {
     let path_name = format!("{name}-{target}-{version}");
-    let path = dirs_next::cache_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join("worker-build")
-        .join(&path_name);
+    let path = cache_root()?.join(&path_name);
     if !path.exists() {
         create_dir_all(&path)
             .with_context(|| format!("Failed to create cache directory {}", path.display()))?;
@@ -143,8 +152,36 @@ fn fix_permissions(options: &mut OpenOptions) -> &mut OpenOptions {
     options
 }
 
-/// Download this binary instance into its cache path
-fn download(url: &str, bin_dir: &Path) -> Result<()> {
+/// Maximum number of download attempts before giving up
+const MAX_DOWNLOAD_ATTEMPTS: u32 = 5;
+
+/// Download this binary instance into its cache path, retrying transient
+/// failures with exponential backoff
+fn download_with_retries(url: &str, bin_dir: &Path, full_name: &str) -> Result<()> {
+    let mut attempt = 1;
+    loop {
+        match download(url, bin_dir) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                if attempt >= MAX_DOWNLOAD_ATTEMPTS {
+                    return Err(err).context(format!(
+                        "Failed to download {full_name} after {MAX_DOWNLOAD_ATTEMPTS} attempts"
+                    ));
+                }
+                let delay = std::time::Duration::from_secs(1 << attempt);
+                PBAR.warn(&format!(
+                    "Failed to download {full_name} (attempt {attempt}/{MAX_DOWNLOAD_ATTEMPTS}): {err:#}. Retrying in {}s...",
+                    delay.as_secs()
+                ));
+                std::thread::sleep(delay);
+                attempt += 1;
+            }
+        }
+    }
+}
+
+/// Download and extract a tar.gz archive, stripping its top-level directory
+pub(crate) fn download(url: &str, bin_dir: &Path) -> Result<()> {
     let agent = ureq::Agent::config_builder()
         .tls_config(
             ureq::tls::TlsConfig::builder()
@@ -168,9 +205,14 @@ fn download(url: &str, bin_dir: &Path) -> Result<()> {
     {
         let mut entry = entry?;
         let path_stripped = entry.path()?.components().skip(1).collect::<PathBuf>();
+        let entry_type = entry.header().entry_type();
+        // Skip the top-level directory itself, pax headers, and links.
+        if path_stripped.as_os_str().is_empty() || !(entry_type.is_dir() || entry_type.is_file()) {
+            continue;
+        }
         let bin_path = bin_dir.join(path_stripped);
 
-        if entry.header().entry_type().is_dir() {
+        if entry_type.is_dir() {
             std::fs::create_dir_all(&bin_path)
                 .with_context(|| format!("Failed to create directory {}", bin_path.display()))?;
         } else {
@@ -184,6 +226,7 @@ fn download(url: &str, bin_dir: &Path) -> Result<()> {
             let mut file = options
                 .create(true)
                 .write(true)
+                .truncate(true)
                 .open(&bin_path)
                 .with_context(|| format!("Failed to create file {}", bin_path.display()))?;
             std::io::copy(&mut entry, &mut file)
@@ -192,63 +235,6 @@ fn download(url: &str, bin_dir: &Path) -> Result<()> {
     }
 
     Ok(())
-}
-
-pub struct Esbuild;
-
-impl BinaryDep for Esbuild {
-    fn full_name(&self) -> &'static str {
-        "Esbuild"
-    }
-    fn name(&self) -> &'static str {
-        "esbuild"
-    }
-    fn version(&self) -> String {
-        CUR_ESBUILD_VERSION.to_string()
-    }
-    fn target(&self) -> &'static str {
-        match (std::env::consts::OS, std::env::consts::ARCH) {
-            ("android", "arm") => "android-arm",
-            ("android", "aarch64") => "android-arm64",
-            ("android", "x86_64") => "android-x64",
-            ("macos", "aarch64") => "darwin-arm64",
-            ("macos", "x86_64") => "darwin-x64",
-            ("freebsd", "aarch64") => "freebsd-arm64",
-            ("freebsd", "x86_64") => "freebsd-x64",
-            ("linux", "arm") => "linux-arm",
-            ("linux", "aarch64") => "linux-arm64",
-            ("linux", "x86") => "linux-ia32",
-            ("linux", "powerpc64") => "linux-ppc64",
-            ("linux", "s390x") => "linux-s390x",
-            ("linux", "x86_64") => "linux-x64",
-            ("netbsd", "aarch64") => "netbsd-arm64",
-            ("netbsd", "x86_64") => "netbsd-x64",
-            ("openbsd", "aarch64") => "openbsd-arm64",
-            ("openbsd", "x86_64") => "openbsd-x64",
-            ("solaris", "x86_64") => "sunos-x64",
-            ("windows", "aarch64") => "win32-arm64",
-            ("windows", "x86") => "win32-ia32",
-            ("windows", "x86_64") => "win32-x64",
-            _ => panic!("Platform unsupported by esbuild."),
-        }
-    }
-    fn download_url(&self) -> String {
-        let version = self.version();
-        let target = self.target();
-        format!("https://registry.npmjs.org/@esbuild/{target}/-/{target}-{version}.tgz")
-    }
-    fn bin_path(&self, name: Option<&str>) -> Result<String> {
-        Ok(match name {
-            None | Some("esbuild") => {
-                if cfg!(windows) {
-                    format!("esbuild{MAYBE_EXE}")
-                } else {
-                    format!("bin/esbuild{MAYBE_EXE}")
-                }
-            }
-            Some(name) => bail!("Unknown binary {name} in {}", self.full_name()),
-        })
-    }
 }
 
 pub struct WasmOpt;

@@ -459,6 +459,29 @@ pub fn do_work () {
 
 See [Signal Example](examples/signals) for a full end-to-end workflow.
 
+## Emscripten
+
+The experimental `worker-build --emscripten` flag can be used to build for
+`wasm32-unknown-emscripten`, giving Workers a libc and epoll-backed sockets.
+
+Just update the build command to add this flag, and the Emscripten toolchain
+will be installed automatically:
+
+```toml
+main = "build/index.js"
+
+[build]
+command = "cargo install -q worker-build && worker-build --emscripten --release"
+```
+
+The build links a **bin** target rather than a `cdylib`, so the package must have
+a bin target (e.g. `src/main.rs` with an empty `fn main() {}`).
+
+See the [emscripten](examples/emscripten), [emscripten-tokio](examples/emscripten-tokio)
+and [emscripten-tcp](examples/emscripten-tcp) examples, which build up from
+`std::fs` on the in-memory filesystem, through Tokio timers, tasks and
+channels, to raw TCP.
+
 ## Panic Recovery with `--panic-unwind`
 
 By default, Rust panics in Workers compile with `panic=abort`, which terminates the WebAssembly
@@ -466,11 +489,13 @@ instance. The `--panic-unwind` flag for `worker-build` changes this behavior so 
 caught and converted to JavaScript exceptions, allowing the Worker to continue serving requests
 after a panic.
 
+When running `worker-build` directly:
+
 ```bash
-npx worker-build --panic-unwind
+worker-build --panic-unwind
 ```
 
-Or in your `wrangler.toml` build command:
+Example `wrangler.toml` build command:
 
 ```toml
 [build]
@@ -549,22 +574,36 @@ root of your project.
 
 ### Step 3: Configure your Miniflare instance in your JavaScript / TypeScript tests
 
-To instantiate the `Miniflare` testing instance in your tests, make sure to
-configure its `scriptPath` option to the relative path of where your JavaScript
-worker entrypoint was generated, and its `moduleRules` so that it is able to
-resolve the `*.wasm` file imported from that JavaScript worker:
+To instantiate the `Miniflare` testing instance, configure an explicit module
+manifest. The build output is a module graph rather than a single file, so the
+manifest needs every generated JavaScript and WebAssembly module under
+`./build/`:
 
 ```js
 // test.mjs
 import assert from "node:assert";
+import { readdirSync, readFileSync } from "node:fs";
 import { Miniflare } from "miniflare";
 
+const modules = {};
+for (const file of readdirSync("./build", { recursive: true })) {
+  const name = `build/${file.replaceAll("\\", "/")}`;
+  if (/\.m?js$/.test(name)) {
+    modules[name] = { type: "esm", contents: readFileSync(name, "utf8") };
+  } else if (name.endsWith(".wasm")) {
+    modules[name] = { type: "wasm", contents: new Uint8Array(readFileSync(name)) };
+  }
+}
+
 const mf = new Miniflare({
-  scriptPath: "./build/worker/shim.mjs",
-  modules: true,
-  modulesRules: [
-    { type: "CompiledWasm", include: ["**/*.wasm"], fallthrough: true }
-  ]
+  workers: [{
+    config: {
+      name: "test",
+      type: "worker",
+      compatibilityDate: "2026-08-21",
+      manifest: { mainModule: "build/index.js", modules },
+    },
+  }],
 });
 
 const res = await mf.dispatchFetch("http://localhost");
@@ -612,6 +651,44 @@ pub async fn main(request: Request, env: Env, _ctx: Context) -> Result<Response>
 ```
 
 
+## Custom Trace Spans
+
+With [tracing enabled](https://developers.cloudflare.com/workers/observability/traces/) on your
+Worker (`observability.traces.enabled = true` in `wrangler.toml`), `worker::observability` binds
+the runtime's [custom spans API](https://developers.cloudflare.com/workers/observability/traces/custom-spans/)
+so your own code shows up in the trace waterfall next to the automatic `fetch`, KV and D1 spans:
+
+```rust
+use worker::observability::{enter_span, enter_span_async, SpanStatus};
+use worker::*;
+
+#[event(fetch)]
+pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
+    let key = req.path();
+    enter_span_async("handle_request", |span| async move {
+        span.set_attribute("http.path", key.as_str());
+        let key = enter_span("parse_key", |_| key.trim_start_matches('/').to_owned());
+
+        // The KV span nests under `handle_request`.
+        match env.kv("SOME_NAMESPACE")?.get(&key).text().await? {
+            Some(text) => Response::ok(text),
+            None => {
+                span.set_status(SpanStatus::Error(Some("key not found".into())));
+                Response::error("Not Found", 404)
+            }
+        }
+    })
+    .await
+}
+```
+
+Spans nest the way `tracing` spans do: a span is made active again on every poll of the future it
+instruments, so concurrent futures each nest under their own span. `start_span` opens a span
+without making it active, `Span::in_scope` and `Span::instrument` make an existing span active for
+a closure or a future, and `active_span` returns the span active right now. See the
+[`custom-spans` example](./examples/custom-spans) for a `tracing_subscriber::Layer` that records
+`tracing` spans and events as platform spans.
+
 # Notes and FAQ
 
 It is exciting to see how much is possible with a framework like this, by expanding the options
@@ -651,7 +728,10 @@ please [take a look](https://www.cloudflare.com/careers/).
 
 - We're working on solutions here, but in the meantime you'll need to minimize the number of crates
   your code depends on, or strip as much from the `.wasm` binary as possible. Here are some extra
-  steps you can try: https://rustwasm.github.io/book/reference/code-size.html#optimizing-builds-for-code-size
+  steps you can try: https://rustwasm.github.io/book/reference/code-size.html#optimizing-builds-for-code-size.
+  Release builds keep Wasm function names for profiles and stack traces; to drop them, set the
+  profile's `wasm-opt` arguments without `-g` (see the
+  [worker-build README](worker-build/README.md)) rather than using `strip = true`.
 
 # Releasing
 
